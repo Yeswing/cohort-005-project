@@ -1,0 +1,48 @@
+# Browser push constraints for Cadence
+
+Research date: 2026-11-11. Resolves [research issue #2](https://github.com/Yeswing/cohort-005-project/issues/2), part of [notification map #1](https://github.com/Yeswing/cohort-005-project/issues/1). Research only; no accounts, paid plans, or application changes.
+
+## Recommendation and unresolved decision
+
+Specify browser push as an optional, best-effort alert alongside the durable in-app inbox. Do not promise immediate delivery, sound, vibration, or delivery after every browser/OS shutdown. Recommend retaining the existing Postmark mail transport and using a small standards-based Web Push adapter for this scope. This is an engineering recommendation, **not an approved vendor decision**. The user must choose between that approach and Knock orchestration before implementation.
+
+## Verified platform constraints
+
+| Target | Supported path and conditions |
+| --- | --- |
+| iPhone/iPad | iOS/iPadOS 16.4+ supports push for **Home Screen web apps**. Supply a web manifest with `display: standalone` or `fullscreen`; explain Add to Home Screen and launch from that icon before enabling push. Request permission from a direct tap/click. An ordinary browser tab is not the supported iOS enrollment path. Focus settings apply. [WebKit](https://webkit.org/blog/13878/) |
+| Android Chrome | Website notifications work through site permission; installation is not required by the documented site flow. Private browsing does not receive notifications. Chrome may remove permission for unused/disruptive sites. [Chrome Help](https://support.google.com/chrome/answer/3220216?co=GENIE.Platform%3DAndroid&hl=en) |
+| Desktop | Chrome, Edge and Firefox implement the standard push path; use runtime feature detection rather than a browser-name promise. Safari supports standards push in Safari 16 on macOS 13+. Desktop website enrollment does not require Home Screen installation. [Google subscription guide](https://web.dev/articles/push-notifications-subscribing-a-user), [Edge guide](https://learn.microsoft.com/en-us/microsoft-edge/progressive-web-apps/how-to/push), [Apple](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers) |
+
+Feature-detect `navigator.serviceWorker`, `window.PushManager`, `Notification`, and `ServiceWorkerRegistration.prototype.showNotification`; handle registration/subscription failures. A supported API does not imply that permission is granted or OS alerts are enabled. HTTPS is required in production: service workers operate in secure contexts; localhost is a development exception. A phone visiting a development machine's plain HTTP LAN address does not inherit the localhost exception. [Google feature detection](https://web.dev/articles/push-notifications-subscribing-a-user), [Mozilla service worker documentation](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API)
+
+## Permission, delivery, sound and vibration
+
+- Keep application push preference, browser permission, and individual browser subscriptions distinct. A user clicking an application toggle cannot override browser denial. Ask only after the user's explicit Enable action; represent unsupported, permission needed, denied, and enabled states. If denied, explain changing browser settings rather than repeatedly prompting. [Google subscription guide](https://web.dev/articles/push-notifications-subscribing-a-user)
+- Push can arrive while the website is not open, but a closed tab differs from a terminated browser. As one concrete limitation, Firefox's new closed-browser delivery is an experimental Windows rollout, unavailable on macOS/Linux and managed installations; it also requires Firefox to have run after a restart. Do not promise universal delivery when the browser is quit. [Mozilla closed-browser support](https://support.mozilla.org/en-US/kb/closed-browser-notifications)
+- Offline messages expire. Set a finite TTL; push-service acceptance is not proof that a human saw a notification. Services may retain fewer messages than sent, and urgency only influences delivery attempts. [RFC 8030](https://www.rfc-editor.org/rfc/rfc8030), [Apple delivery headers](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers)
+- Display a visible notification for each delivered push, even if Cadence is already open. Safari can revoke permission for invisible pushes; Edge may show a generic fallback notification. Do not use push solely to refresh unread counts silently. [Apple](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers), [Edge](https://learn.microsoft.com/en-us/microsoft-edge/progressive-web-apps/how-to/push)
+- The notification standard leaves sound/vibration to platform conventions by default and offers a silent preference; it has no portable custom-sound option. `vibrate` is a nonstandard feature with limited support. Do not offer a guaranteed chime, vibration pattern, or Focus/Do Not Disturb bypass. Use normal system notification behavior and tell users device/browser settings control alerts. [WHATWG Notifications](https://notifications.spec.whatwg.org/), [Mozilla vibrate documentation](https://developer.mozilla.org/en-US/docs/Web/API/Notification/vibrate), [WebKit Focus integration](https://webkit.org/blog/13878/)
+
+## Implementation boundary: own Web Push versus Knock
+
+Repository observation: `app/lib/mailer.server.ts` already exposes `MailTransport`, sends through Postmark when configured, and uses a local `.outbox` otherwise. The README suggests Knock for the notifications lesson; that is not an existing integration or a vendor decision.
+
+| Approach | Boundary and work owned by Cadence |
+| --- | --- |
+| Existing Postmark + standards Web Push | Keep the mail adapter. Add VAPID keys, browser subscription storage, authenticated enrollment/removal, service worker, encrypted sends through a maintained server library, and retry/expiry cleanup. Cadence owns inbox, preferences, routing and delivery jobs. Browsers choose their push services; using Chrome does not itself require Cadence to adopt the Firebase client SDK. [Google architecture](https://web.dev/articles/push-notifications-overview) |
+| Knock orchestration | Knock can orchestrate workflows and in-app feeds and send email through Postmark. Its browser-push tutorial explicitly uses **FCM plus the Firebase SDK**, because Knock has no first-party Web Push channel. Cadence still implements consent, enrollment, service worker/display and per-device token lifecycle; configure Knock workflows and FCM/channel data. The existing mail path must be assigned a single owner to avoid duplicate emails. [Knock features](https://docs.knock.app/getting-started/what-is-knock), [Knock email providers](https://docs.knock.app/integrations/email/overview), [Knock browser-push tutorial](https://docs.knock.app/tutorials/sending-web-push-notifications-with-fcm) |
+
+Knock cannot remove the platform constraints above. Its native APNs sound overrides are not evidence of equivalent custom sound for browser push. If selected, validate the exact Firebase SDK/browser support against the agreed device matrix before committing to rollout. No pricing comparison or account signup was needed.
+
+## Proposed spec requirements and verification
+
+These are design recommendations derived from the constraints, pending product approval:
+
+1. Persist one notification per recipient/event in the inbox and enqueue external delivery after the domain transaction commits. Independent channel attempts must not block the domain action or erase the inbox record. Use an event/recipient idempotency key so retries do not create duplicate inbox records or send jobs.
+2. Store many subscriptions per user, scoped to the authenticated account and browser installation. Enabling push on one device does not enroll others. Unsubscribe this browser separately from disabling the user's push channel. Prevent a subscription from continuing to deliver a previous user's private alerts after account switching/sign-out; enroll again only with the new authenticated account.
+3. Keep VAPID private keys server-side; send only the public key to the client. Treat endpoint/key data as sensitive delivery credentials. Upsert current subscriptions on enrollment; remove expired subscriptions on terminal responses, retry transient errors with bounded backoff, and reconcile permissions/subscriptions when the user returns. Subscription replacement is expected by the [Push API lifecycle](https://w3c.github.io/push-api/).
+4. Include a notification id and safe same-origin destination in the payload. The worker uses `event.waitUntil(showNotification(...))`; clicking focuses/opens the relevant page. Recheck authentication and authorization when following the link. A push click is not automatically evidence of inbox read; define read behavior separately.
+5. Test HTTPS with physical iPhone/iPad Home Screen installation and Android Chrome, plus desktop Chrome/Edge/Firefox and macOS Safari. Cover denied/revoked permission, default permission, multiple devices, account changes, foreground/background/closed tab, browser quit, offline expiry, Focus/OS alerts disabled, dead subscriptions, transient send failure and retries. Verify text and destination without requiring sound/vibration. These are implementation acceptance checks, not claims that physical-device testing happened during research.
+
+Remaining product decisions: vendor/orchestration owner, push default/enablement UX, delivery TTL/retry limits, privacy of lock-screen text, and the minimum tested OS/browser matrix. None was silently selected by this research.
